@@ -1,0 +1,264 @@
+# .gitlab-ci.yml
+# DevSecOps Pipeline – QNX Neutrino embedded application
+# Stages: build → test → security
+#
+# Runner requirement: shell executor tagged [qnx-runner]
+# Host dependencies:  qcc (QNX SDP 8), qemu-system-x86_64, sshpass,
+#                     virsh, cppcheck, flawfinder, gitleaks
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global config
+# ─────────────────────────────────────────────────────────────────────────────
+
+stages:
+  - build
+  - test
+  - security
+
+variables:
+  # ── QNX / QEMU ────────────────────────────────────────────────────────────
+  QNX_SDP_PATH:    "qnx800"
+  QNX_MAC:         "52:54:00:91:01:ea"
+  QNX_USER:        "qnxuser" # QNX_PASS should be set as a CI/CD variable
+  # ── Build ─────────────────────────────────────────────────────────────────
+  BINARY:          "program"
+  QCC_FLAGS:       "-Vgcc_ntox86_64 -Wall -Wextra -Wshadow -fPIC -g -O0 -fno-builtin"
+  # ── Security thresholds ───────────────────────────────────────────────────
+  FLAWFINDER_BLOCK_LEVEL: "4"   # fail pipeline on findings Level ≥ 4
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable QEMU setup/teardown  (referenced with !reference)
+# ─────────────────────────────────────────────────────────────────────────────
+
+.qemu_before: &qemu_before
+  - chmod +x scripts/*.sh tests/*.sh
+  - scripts/qemu_start.sh
+  - export QNX_IP=$(scripts/wait_for_ssh.sh)
+  - echo "  → QNX target IP = $QNX_IP"
+
+.qemu_after: &qemu_after
+  - scripts/qemu_stop.sh
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 – build
+# ─────────────────────────────────────────────────────────────────────────────
+
+build:
+  stage: build
+  tags: [qnx-runner]
+  script:
+    - source "$HOME/$QNX_SDP_PATH/qnxsdp-env.sh"
+    - mkdir -p build
+    - |
+      qcc $QCC_FLAGS -c -o build/$BINARY.o program.c
+      qcc $QCC_FLAGS    -o build/$BINARY    build/$BINARY.o
+    - file build/$BINARY        # verify ELF target
+    - echo "✓ build succeeded"
+  artifacts:
+    name: "qnx-binary-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - build/
+    expire_in: 4 hours
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2 – test  (single QEMU session → smoke then integration)
+# ─────────────────────────────────────────────────────────────────────────────
+
+test:qemu:
+  stage: test
+  tags: [qnx-runner]
+  needs: [build]
+  before_script:
+    - *qemu_before
+  script:
+    # ── Deploy binary ──────────────────────────────────────────────────────
+    - |
+      sshpass -p "$QNX_PASS" scp \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        build/$BINARY $QNX_USER@$QNX_IP:/tmp/$BINARY \
+      || { echo "❌ SCP FAILED"; exit 1; }
+      sshpass -p "$QNX_PASS" ssh \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        $QNX_USER@$QNX_IP \
+        "ls -l /tmp/$BINARY && sync"
+      sshpass -p "$QNX_PASS" ssh \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        $QNX_USER@$QNX_IP "chmod +x /tmp/$BINARY"
+
+    # ── Smoke tests ───────────────────────────────────────────────────────
+    - echo "━━━ SMOKE TESTS ━━━"
+    - bash tests/smoke_test.sh "$QNX_USER" "$QNX_IP" "$QNX_PASS" "/tmp/$BINARY"
+
+    # ── Integration tests ─────────────────────────────────────────────────
+    - echo "━━━ INTEGRATION TESTS ━━━"
+    - bash tests/integration_test.sh "$QNX_USER" "$QNX_IP" "$QNX_PASS" "/tmp/$BINARY"
+  after_script:
+    - *qemu_after
+
+  artifacts:
+    name: "test-results-$CI_COMMIT_SHORT_SHA"
+    when: always
+    paths:
+      - test-results/
+    reports:
+      junit: test-results/integration.xml
+    expire_in: 2 weeks
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3 – security
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── 3a. cppcheck – static analysis (safe version must be error-free) ─────────
+
+security:cppcheck:
+  stage: security
+  tags: [qnx-runner]
+  needs: []
+  script:
+    - mkdir -p reports
+    - |
+      cppcheck \
+        --enable=all \
+        --error-exitcode=0 \
+        --suppress=missingIncludeSystem \
+        --suppress=unusedFunction \
+        --xml --xml-version=2 \
+        program.c 2> reports/cppcheck.xml
+    - |
+      # Count severity=error findings (not warnings) in program.c
+      ERRORS=$(grep -c 'severity="error"' reports/cppcheck.xml || true)
+      echo "cppcheck errors in program.c: $ERRORS"
+      if [ "$ERRORS" -gt 0 ]; then
+        echo "SECURITY GATE FAILED: cppcheck found $ERRORS error(s) in program.c"
+        cat reports/cppcheck.xml
+        exit 1
+      fi
+      echo "✓ cppcheck gate passed (0 errors in program.c)"
+  artifacts:
+    name: "cppcheck-$CI_COMMIT_SHORT_SHA"
+    when: always
+    paths:
+      - reports/cppcheck.xml
+    expire_in: 2 weeks
+
+# ── 3b. Flawfinder – C/C++ SAST (security gate on program.c) ─────────────────
+
+security:flawfinder:
+  stage: security
+  tags: [qnx-runner]
+  needs: []
+  script:
+    - mkdir -p reports
+    - |
+      flawfinder \
+        --html --context --minlevel=1 \
+        program.c > reports/flawfinder.html 2>&1
+
+      flawfinder --dataonly --minlevel=1 program.c \
+        > reports/flawfinder.txt 2>&1 || true
+
+      # Count findings at or above the blocking level
+      CRITICAL=$(flawfinder --dataonly --minlevel="$FLAWFINDER_BLOCK_LEVEL" \
+                  program.c 2>/dev/null \
+                | grep -cE '^program\.c:[0-9]+' || true)
+
+      echo "Flawfinder Level≥${FLAWFINDER_BLOCK_LEVEL} findings in program.c: $CRITICAL"
+
+      if [ "$CRITICAL" -gt 0 ]; then
+        echo ""
+        echo "╔══════════════════════════════════════════════════════╗"
+        echo "║  ⛔  SECURITY GATE BLOCKED – MERGE PREVENTED         ║"
+        echo "║     Critical findings in program.c (level≥4)         ║"
+        echo "╚══════════════════════════════════════════════════════╝"
+        flawfinder --minlevel="$FLAWFINDER_BLOCK_LEVEL" program.c
+        exit 1
+      fi
+      echo "✓ Flawfinder gate passed – no Level≥4 findings in program.c"
+  artifacts:
+    name: "flawfinder-$CI_COMMIT_SHORT_SHA"
+    when: always
+    paths:
+      - reports/flawfinder.html
+      - reports/flawfinder.txt
+    expire_in: 2 weeks
+
+# ── 3c. Secret detection – gitleaks scans for hardcoded credentials ──────────
+
+security:secrets:
+  stage: security
+  tags: [qnx-runner]
+  needs: []
+  script:
+    - mkdir -p reports
+
+    # ── Option A: gitleaks (preferred) ───────────────────────────────────
+    - |
+      echo "Using gitleaks for secret detection"
+
+      # Scan only program.c (the production file) – must be clean
+      gitleaks detect \
+        --no-git \
+        --source program.c \
+        --report-format json \
+        --report-path reports/gitleaks.json \
+        --exit-code 1 2>&1 \
+      && echo "✓ No secrets in program.c" \
+      || {
+        echo "⛔ SECURITY GATE FAILED: Secrets found in program.c"
+        cat reports/gitleaks.json
+        exit 1
+      }
+  artifacts:
+    name: "secrets-$CI_COMMIT_SHORT_SHA"
+    when: always
+    paths:
+      - reports/gitleaks.json
+    expire_in: 2 weeks
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aggregate report job (runs after all security jobs, always)
+# ─────────────────────────────────────────────────────────────────────────────
+
+security:report:
+  stage: security
+  tags: [qnx-runner]
+  needs:
+    - job: security:cppcheck
+      artifacts: true
+    - job: security:flawfinder
+      artifacts: true
+    - job: security:secrets
+      artifacts: true
+  when: always
+  script:
+    - |
+      echo "╔════════════════════════════════════════════════════════╗"
+      echo "║          DEVSECOPS PIPELINE – SECURITY SUMMARY         ║"
+      echo "╠════════════════════════════════════════════════════════╣"
+      printf "║  Commit  : %-44s║\n" "$CI_COMMIT_SHORT_SHA"
+      printf "║  Branch  : %-44s║\n" "$CI_COMMIT_REF_NAME"
+      printf "║  Pipeline: %-44s║\n" "$CI_PIPELINE_ID"
+      echo "╠════════════════════════════════════════════════════════╣"
+
+      # cppcheck
+      if [ -f reports/cppcheck.xml ]; then
+        E=$(grep -c 'severity="error"' reports/cppcheck.xml || true)
+        W=$(grep -c 'severity="warning"' reports/cppcheck.xml || true)
+        printf "║  cppcheck (program.c)    errors=%-3s warnings=%-10s║\n" "$E" "$W"
+      fi
+
+      # flawfinder
+      if [ -f reports/flawfinder.txt ]; then
+        L4=$(grep -c "Level [45]" reports/flawfinder.txt || true)
+        printf "║  flawfinder (program.c)  Level≥4 findings: %-12s║\n" "$L4"
+      fi
+
+      echo "╚════════════════════════════════════════════════════════╝"
+      echo ""
+      echo "Full reports available in pipeline artifacts."
+  artifacts:
+    name: "security-summary-$CI_COMMIT_SHORT_SHA"
+    when: always
+    paths:
+      - reports/
+    expire_in: 4 weeks
