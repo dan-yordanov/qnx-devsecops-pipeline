@@ -1,4 +1,4 @@
-# QNX DevSecOps Pipeline
+# QNX DevSecOps Pipeline - VULNERABLE version
 
 A GitLab CI/CD pipeline implementing **DevSecOps practices** for a
 QNX Neutrino real-time embedded application.
@@ -26,6 +26,10 @@ and enforces a security gate before any merge is allowed.
 - **flawfinder** — any CWE finding at Level ≥ 4 blocks the pipeline
 - **gitleaks** — hardcoded credentials prevent merge
 
+The `program.c` file is included **intentionally** to
+demonstrate that all three gates fire correctly on real vulnerabilities
+(CWE-798, CWE-120, CWE-134, CWE-78, CWE-190, CWE-415, CWE-788, CWE-476).
+
 ## Requirements
 
 | Tool              | Purpose                        |
@@ -38,7 +42,7 @@ and enforces a security gate before any merge is allowed.
 | sshpass           | Non-interactive SSH in CI      |
 
 ## Repository Structure
-├── program.c               # Safe program \
+├── program.c               # VULNERABLE program \
 ├── .gitlab-ci.yml          # Full DevSecOps pipeline definition \
 ├── scripts/ \
 │   ├── qemu_start.sh       # Start QNX VM in daemon mode \
